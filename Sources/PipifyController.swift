@@ -58,12 +58,30 @@ public final class PipifyController: NSObject, ObservableObject, AVPictureInPict
         #endif
     }
     
+    private let metalDevice = MTLCreateSystemDefaultDevice()
+    private let metalCommandQueue: MTLCommandQueue?
+    private var hostingController: UIHostingController<AnyView>?
+    private var metalLayer: CAMetalLayer?
+    private var maximumUpdatesPerSecond: Double = 30
+    
     public override init() {
+        self.metalCommandQueue = metalDevice?.makeCommandQueue()
         super.init()
         Self.setupAudioSession()
         setupController()
+        setupMetal()
     }
 
+    private func setupMetal() {
+        guard let metalDevice = metalDevice else { return }
+        
+        let metalLayer = CAMetalLayer()
+        metalLayer.device = metalDevice
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = true
+        self.metalLayer = metalLayer
+    }
+    
     private func setupController() {
         logger.info("creating pip controller")
         
@@ -75,43 +93,105 @@ public final class PipifyController: NSObject, ObservableObject, AVPictureInPict
             playbackDelegate: self
         ))
         
-        // Combined with a certain time range this makes it so the skip buttons are not visible / interactable.
-        // if an `onSkip` closure is provied then we don't do this
         pipController?.requiresLinearPlayback = onSkip == nil
-        
         pipController?.delegate = self
     }
     
     @MainActor func setView(_ view: some View, maximumUpdatesPerSecond: Double = 30) {
+        self.maximumUpdatesPerSecond = maximumUpdatesPerSecond
         let modifiedView = view.environmentObject(self)
-        let renderer = ImageRenderer(content: modifiedView)
+        hostingController = UIHostingController(rootView: AnyView(modifiedView))
         
-        renderer
-            .objectWillChange
-            // limit the number of times we redraw per second (performance)
-            .throttle(for: .init(1.0 / maximumUpdatesPerSecond), scheduler: RunLoop.main, latest: true)
-            .sink { [weak self] _ in
-                self?.render(view: modifiedView, using: renderer)
-            }
-            .store(in: &rendererSubscriptions)
+        if let hostingView = hostingController?.view {
+            // Add metal layer as sublayer instead of replacing the main layer
+            metalLayer?.frame = hostingView.bounds
+            hostingView.layer.addSublayer(metalLayer!)
+        }
         
-        // first draw
-        render(view: modifiedView, using: renderer)
+        let displayLink = CADisplayLink(target: self, selector: #selector(updateFrame))
+        displayLink.preferredFramesPerSecond = Int(maximumUpdatesPerSecond)
+        displayLink.add(to: .main, forMode: .common)
+        
+        updateFrame()
     }
     
-    // MARK: - Rendering
     
-    private func render(view: some View, using renderer: ImageRenderer<some View>) {
-        Task {
-            do {
-                let buffer = try await view.makeBuffer(renderer: renderer)
-                render(buffer: buffer)
-            } catch {
-                logger.error("failed to create buffer: \(error.localizedDescription)")
-            }
+    @objc private func updateFrame() {
+        guard let metalLayer = metalLayer,
+              let texture = metalLayer.nextDrawable()?.texture,
+              let commandBuffer = metalCommandQueue?.makeCommandBuffer(),
+              let renderPass = createRenderPass(texture: texture) else {
+            return
+        }
+        
+        // Perform Metal rendering here
+        renderPass.endEncoding()
+        commandBuffer.present(metalLayer.nextDrawable()!)
+        commandBuffer.commit()
+        
+        // Convert Metal texture to CMSampleBuffer
+        if let sampleBuffer = createSampleBuffer(from: texture) {
+            render(buffer: sampleBuffer)
         }
     }
     
+    private func createRenderPass(texture: MTLTexture) -> MTLRenderCommandEncoder? {
+        guard let commandBuffer = metalCommandQueue?.makeCommandBuffer() else {
+            return nil
+        }
+        let descriptor = MTLRenderPassDescriptor()
+        
+        descriptor.colorAttachments[0].texture = texture
+        descriptor.colorAttachments[0].loadAction = .clear
+        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        
+        return commandBuffer.makeRenderCommandEncoder(descriptor: descriptor)
+    }
+    
+    private func createSampleBuffer(from texture: MTLTexture) -> CMSampleBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        let width = texture.width
+        let height = texture.height
+        
+        let attributes = [
+            kCVPixelBufferMetalCompatibilityKey: true
+        ] as CFDictionary
+        
+        CVPixelBufferCreate(kCFAllocatorDefault,
+                           width,
+                           height,
+                           kCVPixelFormatType_32BGRA,
+                           attributes,
+                           &pixelBuffer)
+        
+        guard let pixelBuffer = pixelBuffer else { return nil }
+        
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: Int32(maximumUpdatesPerSecond)),
+            presentationTimeStamp: .zero,
+            decodeTimeStamp: .invalid
+        )
+        
+        var formatDesc: CMFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDesc
+        )
+        
+        guard let formatDesc = formatDesc else { return nil }
+        
+        var sampleBuffer: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: formatDesc,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        )
+        
+        return sampleBuffer
+    }
     private func render(buffer: CMSampleBuffer) {
         if bufferLayer.status == .failed {
             bufferLayer.flush()
@@ -267,3 +347,74 @@ public final class PipifyController: NSObject, ObservableObject, AVPictureInPict
 }
 
 let logger = Logger(subsystem: "com.getsidetrack.pipify", category: "Pipify")
+
+extension UIImage {
+    func makeSampleBuffer() -> CMSampleBuffer? {
+        guard let cgImage = self.cgImage else { return nil }
+        
+        var info = CMSampleTimingInfo()
+        info.presentationTimeStamp = .zero
+        info.duration = .invalid
+        info.decodeTimeStamp = .invalid
+        
+        var formatDesc: CMFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: cgImage.makePixelBuffer()!,
+            formatDescriptionOut: &formatDesc
+        )
+        
+        var sampleBuffer: CMSampleBuffer?
+        
+        guard let formatDesc = formatDesc else { return nil }
+        
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: cgImage.makePixelBuffer()!,
+            formatDescription: formatDesc,
+            sampleTiming: &info,
+            sampleBufferOut: &sampleBuffer
+        )
+        
+        return sampleBuffer
+    }
+}
+
+// Extension to convert CGImage to CVPixelBuffer
+extension CGImage {
+    func makePixelBuffer() -> CVPixelBuffer? {
+        let width = self.width
+        let height = self.height
+        
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32ARGB,
+            nil,
+            &pixelBuffer
+        )
+        
+        guard status == kCVReturnSuccess, let pixelBuffer = pixelBuffer else {
+            return nil
+        }
+        
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        
+        let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(pixelBuffer),
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        )
+        
+        context?.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        
+        return pixelBuffer
+    }
+}
