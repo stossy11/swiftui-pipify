@@ -111,7 +111,9 @@ public final class PipifyController: NSObject, ObservableObject, AVPictureInPict
         return sampleBuffer
     }
     
-    @MainActor func setView(_ view: UIView, maximumUpdatesPerSecond: Double = 30) {
+    @MainActor func setView(_ view: some View, maximumUpdatesPerSecond: Double = 30) {
+        let view = UIHostingController(rootView: view).view!
+        
         self.currentView = view
         
         Timer.publish(every: 1.0 / maximumUpdatesPerSecond, on: .main, in: .common)
